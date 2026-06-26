@@ -1,1 +1,18 @@
-
+{
+  "name": "croma-price-alert-bot",
+  "version": "1.0.0",
+  "description": "Croma.com Price Alert Telegram Bot with pincode support",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "node-telegram-bot-api": "^0.64.0",
+    "axios": "^1.6.7",
+    "cheerio": "^1.0.0-rc.12",
+    "express": "^4.18.2"
+  }
+}
