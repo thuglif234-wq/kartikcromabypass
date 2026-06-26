@@ -1,8 +1,8 @@
 const TelegramBot = require("node-telegram-bot-api");
 const axios = require("axios");
-const cheerio = require("cheerio");
 const express = require("express");
 const fs = require("fs");
+const puppeteer = require("puppeteer");
 
 // ─── CONFIG ────────────────────────────────────────────────────────────────
 const TOKEN = "8886757834:AAHBChGEoCndNDtKWPp22bL-B1PGN52_CfQ";
@@ -17,16 +17,14 @@ app.get("/", (req, res) => res.send("🤖 Croma Price Alert Bot is LIVE!"));
 app.get("/ping", (req, res) => res.json({ status: "ok", time: new Date().toISOString() }));
 app.listen(PORT, () => console.log(`✅ Keep-alive server on port ${PORT}`));
 
-// Self-ping every 25 seconds to prevent Render free-tier sleep
 setInterval(() => {
   axios.get(`${RENDER_URL}/ping`).catch(() => {});
 }, 25000);
 
-// ─── DATA STORE ────────────────────────────────────────────────────────────
+// ─── DATA STORE (NO DEFAULT PINCODES) ──────────────────────────────────────
 let db = {
   users: {},          // { userId: { approved, pincodes[], trackings{} } }
   pendingUsers: {},   // { userId: { firstName, username, requestTime } }
-  defaultPincodes: ["400001", "110001", "560001", "500001", "700001"],
 };
 
 if (fs.existsSync(DATA_FILE)) {
@@ -37,97 +35,54 @@ const save = () => fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2));
 
 // ─── BOT INIT ──────────────────────────────────────────────────────────────
 const bot = new TelegramBot(TOKEN, { polling: true });
-const userStates = {};    // multi-step state per user
-const intervals = {};     // setInterval handles per user
+const userStates = {};
+const intervals = {};
 
-// ─── PRICE SCRAPER ─────────────────────────────────────────────────────────
+// ─── PUPPETEER PRICE SCRAPER ───────────────────────────────────────────────
 async function fetchCromaPrice(url, pincode) {
+  let browser;
   try {
-    // Extract product ID from URL  (e.g. /p/261373)
-    const pidMatch = url.match(/\/p\/(\d+)/);
-    const productId = pidMatch ? pidMatch[1] : null;
-
-    // Try Croma's internal price API first
-    if (productId) {
-      try {
-        const apiUrl = `https://api.croma.com/products/v2/${productId}?pincode=${pincode}`;
-        const apiResp = await axios.get(apiUrl, {
-          timeout: 10000,
-          headers: {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120",
-            "Accept": "application/json",
-            "Origin": "https://www.croma.com",
-            "Referer": "https://www.croma.com/",
-          },
-        });
-        const d = apiResp.data;
-        const price =
-          d?.price?.sellingPrice ||
-          d?.sellingPrice ||
-          d?.data?.sellingPrice ||
-          null;
-        const name =
-          d?.name || d?.data?.name || d?.productName || null;
-        if (price) return { price: parseFloat(String(price).replace(/[^0-9.]/g, "")), name, url, productId };
-      } catch (_) {}
-    }
-
-    // Fallback: scrape HTML page with pincode cookie
-    const resp = await axios.get(url, {
-      timeout: 15000,
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-IN,en;q=0.9",
-        "Cookie": `pincode=${pincode}; selectedPincode=${pincode}; storeId=${pincode}`,
-        "Referer": "https://www.croma.com/",
-      },
+    browser = await puppeteer.launch({
+      headless: "new",
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+    });
+    const page = await browser.newPage();
+    
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+    
+    await page.setRequestInterception(true);
+    page.on('request', (req) => {
+      if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) {
+        req.abort();
+      } else {
+        req.continue();
+      }
     });
 
-    const $ = cheerio.load(resp.data);
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 40000 });
 
-    // Price selectors (Croma uses these class names)
-    const priceSelectors = [
-      ".pdp-selling-price",
-      '[data-testid="pdp-selling-price"]',
-      ".selling-price",
-      ".new-price",
-      ".amount",
-      ".price-current",
-      ".offer-price",
-      "span.pdp-price",
-    ];
+    await page.setCookie(
+      { name: 'pincode', value: pincode, domain: '.croma.com' },
+      { name: 'selectedPincode', value: pincode, domain: '.croma.com' }
+    );
+    
+    await page.reload({ waitUntil: 'domcontentloaded' });
 
-    let price = null;
-    for (const sel of priceSelectors) {
-      const el = $(sel).first();
-      if (el.length) {
-        const raw = el.text().replace(/[^\d]/g, "");
-        if (raw.length >= 2) { price = parseInt(raw, 10); break; }
-      }
-    }
+    const priceSelector = '.pdp-selling-price, [data-testid="pdp-selling-price"], .cp-price, .pdp-price';
+    const titleSelector = 'h1.pdp-title, h1, title';
 
-    // Fallback: JSON-LD schema
-    if (!price) {
-      $('script[type="application/ld+json"]').each((_, el) => {
-        try {
-          const json = JSON.parse($(el).html());
-          const p = json?.offers?.price || json?.price;
-          if (p && !price) price = parseFloat(p);
-        } catch (_) {}
-      });
-    }
+    await page.waitForSelector(priceSelector, { timeout: 8000 });
 
-    const name =
-      $("h1.pdp-title").first().text().trim() ||
-      $("h1").first().text().trim() ||
-      $("title").text().split("|")[0].trim() ||
-      "Croma Product";
+    const priceText = await page.$eval(priceSelector, el => el.textContent);
+    const nameText = await page.$eval(titleSelector, el => el.textContent.split("|")[0].trim());
 
-    return { price, name, url, productId };
+    const price = parseInt(priceText.replace(/[^\d]/g, ""), 10);
+
+    return { price: price || null, name: nameText || "Croma Product", url };
   } catch (err) {
-    console.error(`❌ Price fetch error [Pin: ${pincode}]: ${err.message}`);
-    return { price: null, name: null, url, productId: null };
+    return { price: null, name: null, url };
+  } finally {
+    if (browser) await browser.close();
   }
 }
 
@@ -136,12 +91,18 @@ async function checkAllPrices(userId) {
   const user = db.users[userId];
   if (!user?.approved) return;
 
-  const pincodes = user.pincodes?.length ? user.pincodes : db.defaultPincodes;
+  // Agar pincodes khali hain, to check nahi karega
+  const pincodes = user.pincodes || [];
+  if (pincodes.length === 0) {
+    console.log(`⚠️  [SKIPPED LOOP] User ID: ${userId} has not set any pincodes yet.`);
+    return;
+  }
+
   const trackings = user.trackings || {};
   const activeTracksCount = Object.values(trackings).filter(t => t.active).length;
 
   if (activeTracksCount > 0) {
-    console.log(`\n⏰ [${new Date().toLocaleTimeString()}] Starting price check for User ID: ${userId} (${activeTracksCount} active products)...`);
+    console.log(`\n⏰ [${new Date().toLocaleTimeString()}] Starting price check for User ID: ${userId}...`);
   }
 
   for (const [trackId, t] of Object.entries(trackings)) {
@@ -152,7 +113,7 @@ async function checkAllPrices(userId) {
     for (const pin of pincodes) {
       const result = await fetchCromaPrice(t.url, pin);
       if (result.price == null) {
-        console.log(`⚠️  [SKIPPED] Could not fetch price for ${shortName} at Pin: ${pin}`);
+        console.log(`⚠️  [SKIPPED] Fetch Error for ${shortName} at Pin: ${pin}`);
         continue;
       }
 
@@ -164,8 +125,7 @@ async function checkAllPrices(userId) {
         const emoji = diff < 0 ? "📉" : "📈";
         const word = diff < 0 ? "DECREASED" : "INCREASED";
         
-        // Render Terminal Log for Change
-        console.log(`🚨 [ALERT] Price changed for ${shortName} at Pin: ${pin}! ₹${prev} -> ₹${result.price} (Diff: ${diff})`);
+        console.log(`🚨 [ALERT] Price changed for ${shortName} at Pin: ${pin}! ₹${prev} -> ₹${result.price}`);
 
         const msg =
           `🔔 *Price Alert — Price ${word}!*\n\n` +
@@ -177,7 +137,6 @@ async function checkAllPrices(userId) {
 
         bot.sendMessage(userId, msg, { parse_mode: "Markdown" }).catch(() => {});
       } else {
-        // Render Terminal Log for Stable Price
         console.log(`🔍 [STABLE] User: ${userId} | ${shortName} | Pin: ${pin} | Price: ₹${result.price}`);
       }
 
@@ -189,6 +148,8 @@ async function checkAllPrices(userId) {
 }
 
 function startTracking(userId) {
+  const user = db.users[userId];
+  if (!user?.pincodes || user.pincodes.length === 0) return; // Don't start loop if no pincodes
   if (intervals[userId]) clearInterval(intervals[userId]);
   intervals[userId] = setInterval(() => checkAllPrices(userId), 30000);
 }
@@ -217,8 +178,9 @@ bot.onText(/\/start/, async (msg) => {
       save();
     }
     startTracking(uid);
+    const pinsSet = db.users[uid].pincodes?.length ? db.users[uid].pincodes.join(", ") : "None Set (Please set pincodes first)";
     return bot.sendMessage(uid,
-      `👑 *Welcome Admin!*\n\nCroma Price Alert Bot is RUNNING.\n📍 Default Pincodes: ${db.defaultPincodes.join(", ")}\n\nCommands:\n/admin — Admin panel\n/setpincodes 400001,110001 — Change default pincodes`,
+      `👑 *Welcome Admin!*\n\nCroma Price Alert Bot is RUNNING.\n📍 Your Pincodes: ${pinsSet}\n\nCommands:\n/admin — Admin panel`,
       { parse_mode: "Markdown", ...mainMenu });
   }
 
@@ -236,7 +198,6 @@ bot.onText(/\/start/, async (msg) => {
   db.pendingUsers[uid] = { firstName, username, requestTime: new Date().toISOString() };
   save();
 
-  // Notify admin
   bot.sendMessage(ADMIN_ID,
     `🔔 *New User Request*\n\n👤 Name: ${firstName}\n🆔 ID: ${uid}\n📱 @${username || "N/A"}`,
     {
@@ -258,15 +219,13 @@ bot.on("callback_query", async (q) => {
   const callerId = String(q.from.id);
   const data_str = q.data;
 
-  // ── Admin: Approve/Reject user ──
   if (data_str.startsWith("APPROVE_") && callerId === ADMIN_ID) {
     const targetUid = data_str.replace("APPROVE_", "");
     db.users[targetUid] = { approved: true, pincodes: [], trackings: {} };
     delete db.pendingUsers[targetUid];
     save();
-    startTracking(targetUid);
     bot.sendMessage(Number(targetUid),
-      "✅ *Aapki request approve ho gayi!*\n\nWelcome to Croma Price Alert Bot!\nNiche menu se shuru karein.",
+      "✅ *Aapki request approve ho gayi!*\n\n⚠️ *Important:* Pehle '📍 Manage Pincodes' button daba kar apne pincode set karein, tabhi tracking kaam karegi.",
       { parse_mode: "Markdown", ...mainMenu });
     bot.editMessageText(`✅ User ${targetUid} approved!`, { chat_id: q.message.chat.id, message_id: q.message.message_id });
     return bot.answerCallbackQuery(q.id, { text: "✅ Approved" });
@@ -281,7 +240,6 @@ bot.on("callback_query", async (q) => {
     return bot.answerCallbackQuery(q.id, { text: "❌ Rejected" });
   }
 
-  // ── Stop single tracking ──
   if (data_str.startsWith("STOP_")) {
     const [, uid, ...rest] = data_str.split("_");
     if (uid !== callerId) return bot.answerCallbackQuery(q.id, { text: "❌ Unauthorized" });
@@ -296,7 +254,6 @@ bot.on("callback_query", async (q) => {
     return;
   }
 
-  // ── Stop ALL trackings ──
   if (data_str.startsWith("STOPALL_")) {
     const uid = data_str.replace("STOPALL_", "");
     if (uid !== callerId) return bot.answerCallbackQuery(q.id, { text: "❌ Unauthorized" });
@@ -323,21 +280,28 @@ bot.on("message", async (msg) => {
   }
 
   const user = db.users[uid];
-
-  // ── Multi-step state handler ──
   const state = userStates[uid];
 
   if (state?.action === "add_url") {
     if (!text.includes("croma.com")) {
       return bot.sendMessage(uid, "❌ Kripya valid Croma.com product URL bhejein.");
     }
+
+    // Pincode validation check before letting them add URL
+    if (!user.pincodes || user.pincodes.length === 0) {
+      delete userStates[uid];
+      return bot.sendMessage(uid, "❌ Tracking nahi start ho sakti! Pehle '📍 Manage Pincodes' option me jaakar kam se kam ek pincode add karein.", mainMenu);
+    }
+
     const active = Object.values(user.trackings || {}).filter(t => t.active);
     if (active.length >= 40) {
       delete userStates[uid];
       return bot.sendMessage(uid, "❌ Maximum 40 trackings ho gayi hain. Pehle kuch band karein.", mainMenu);
     }
+
     const trackId = `T${Date.now()}`;
     if (!user.trackings) user.trackings = {};
+    
     user.trackings[trackId] = {
       url: text, active: true,
       addedAt: new Date().toISOString(),
@@ -346,13 +310,31 @@ bot.on("message", async (msg) => {
     save();
     delete userStates[uid];
 
-    const pins = user.pincodes?.length ? user.pincodes : db.defaultPincodes;
-    bot.sendMessage(uid,
-      `✅ *Tracking Shuru Hui!*\n\n🔗 URL add ho gayi\n📍 Pincodes: ${pins.join(", ")}\n⏰ Har 30 second me price check hogi.`,
-      { parse_mode: "Markdown", ...mainMenu });
+    bot.sendMessage(uid, `⏳ *Link Added! Fetching Live Price instantly...* Please wait.`);
 
-    // Immediate first check
-    setTimeout(() => checkAllPrices(uid), 3000);
+    // INSTANT LIVE PRICE FETCH CHECK
+    const targetPin = user.pincodes[0]; // First target pincode for live display
+    const liveCheck = await fetchCromaPrice(text, targetPin);
+
+    if (liveCheck.price) {
+      user.trackings[trackId].productName = liveCheck.name;
+      user.trackings[trackId].lastPrices[targetPin] = liveCheck.price;
+      save();
+
+      bot.sendMessage(uid, 
+        `🚀 *Tracking Successfully Started!*\n\n` +
+        `📦 *Product Name:* ${liveCheck.name}\n` +
+        `💰 *Live Current Price:* ₹${liveCheck.price.toLocaleString("en-IN")} (At Pin: ${targetPin})\n` +
+        `📍 *Total Tracking Pincodes:* ${user.pincodes.join(", ")}\n` +
+        `⏰ Bot will check prices every 30 seconds now.`, 
+        { parse_mode: "Markdown", ...mainMenu }
+      );
+    } else {
+      bot.sendMessage(uid, `✅ Link queued! Prices will update in the next background cycle (within 30s).`, mainMenu);
+    }
+
+    // Start background loop immediately
+    startTracking(uid);
     return;
   }
 
@@ -364,13 +346,19 @@ bot.on("message", async (msg) => {
     user.pincodes = pins;
     save();
     delete userStates[uid];
+
+    // Restart looping if they have items tracking
+    startTracking(uid);
+
     return bot.sendMessage(uid,
       `✅ *Pincodes update ho gaye!*\n\n${pins.map(p => `📍 ${p}`).join("\n")}`,
       { parse_mode: "Markdown", ...mainMenu });
   }
 
-  // ── Main menu buttons ──
   if (text === "➕ Add Price Alert") {
+    if (!user.pincodes || user.pincodes.length === 0) {
+      return bot.sendMessage(uid, "⚠️ Pehle '📍 Manage Pincodes' ka use karke pincodes set karein, uske baad hi alert add hoga.");
+    }
     userStates[uid] = { action: "add_url" };
     return bot.sendMessage(uid,
       "🔗 *Price Alert Add Karein*\n\nCroma product ka URL bhejein:\n\nExample:\nhttps://www.croma.com/apple-iphone.../p/261373",
@@ -382,7 +370,7 @@ bot.on("message", async (msg) => {
     if (!active.length) {
       return bot.sendMessage(uid, "📭 Koi active tracking nahi hai.", mainMenu);
     }
-    const pins = user.pincodes?.length ? user.pincodes : db.defaultPincodes;
+    const pins = user.pincodes || [];
     let out = `📋 *Active Trackings (${active.length}/40)*\n\n`;
     active.forEach(([, t], i) => {
       out += `*${i + 1}. ${(t.productName || "Product").substring(0, 50)}*\n`;
@@ -396,10 +384,10 @@ bot.on("message", async (msg) => {
   }
 
   if (text === "📍 Manage Pincodes") {
-    const cur = user.pincodes?.length ? user.pincodes : db.defaultPincodes;
+    const cur = user.pincodes || [];
     userStates[uid] = { action: "set_pincodes" };
     return bot.sendMessage(uid,
-      `📍 *Pincodes Manage Karein*\n\nCurrent pincodes:\n${cur.map(p => p).join("\n")}\n\n✏️ Naye pincodes bhejein (ek line me ek):\n\nExample:\n400001\n110001\n560001`,
+      `📍 *Pincodes Manage Karein*\n\nCurrent pincodes:\n${cur.length ? cur.join("\n") : "None Set"}\n\n✏️ Naye pincodes bhejein (ek line me ek):\n\nExample:\n400001\n110001\n560001`,
       { parse_mode: "Markdown" });
   }
 
@@ -420,7 +408,7 @@ bot.on("message", async (msg) => {
   }
 });
 
-// ─── ADMIN COMMANDS ────────────────────────────────────────────────────────
+// ─── ADMIN PANEL ───────────────────────────────────────────────────────────
 bot.onText(/\/admin/, (msg) => {
   if (String(msg.from.id) !== ADMIN_ID) return;
   const pending  = Object.keys(db.pendingUsers).length;
@@ -432,8 +420,7 @@ bot.onText(/\/admin/, (msg) => {
     `👑 *Admin Panel*\n\n` +
     `👥 Approved Users: ${approved}\n` +
     `⏳ Pending: ${pending}\n` +
-    `📊 Total Active Trackings: ${total}\n` +
-    `📍 Default Pincodes: ${db.defaultPincodes.join(", ")}\n\n`;
+    `📊 Total Active Trackings: ${total}\n\n`;
 
   if (pending) {
     out += "*Pending Requests:*\n";
@@ -444,17 +431,6 @@ bot.onText(/\/admin/, (msg) => {
   bot.sendMessage(ADMIN_ID, out, { parse_mode: "Markdown" });
 });
 
-// /setpincodes 400001,110001,560001
-bot.onText(/\/setpincodes (.+)/, (msg, match) => {
-  if (String(msg.from.id) !== ADMIN_ID) return;
-  const pins = match[1].split(",").map(p => p.trim()).filter(p => /^\d{6}$/.test(p));
-  if (!pins.length) return bot.sendMessage(ADMIN_ID, "❌ Format: /setpincodes 400001,110001,560001");
-  db.defaultPincodes = pins;
-  save();
-  bot.sendMessage(ADMIN_ID, `✅ Default pincodes set: ${pins.join(", ")}`);
-});
-
-// /broadcast <message>
 bot.onText(/\/broadcast (.+)/, (msg, match) => {
   if (String(msg.from.id) !== ADMIN_ID) return;
   const text = match[1];
@@ -468,10 +444,8 @@ bot.onText(/\/broadcast (.+)/, (msg, match) => {
 
 // ─── STARTUP ───────────────────────────────────────────────────────────────
 Object.entries(db.users).forEach(([uid, u]) => {
-  if (u.approved) startTracking(uid);
+  if (u.approved && u.pincodes && u.pincodes.length > 0) startTracking(uid);
 });
 
-console.log("🤖 Croma Price Alert Bot STARTED");
+console.log("🤖 Croma Price Alert Bot STARTED (No Defaults Mode)");
 console.log(`👑 Admin: ${ADMIN_ID}`);
-console.log(`📍 Default Pincodes: ${db.defaultPincodes.join(", ")}`);
-console.log(`👥 Approved users: ${Object.keys(db.users).length}`);
