@@ -1,16 +1,16 @@
 {
-  "name": "croma-price-tracker-bot",
-  "version": "1.0.0",
-  "description": "Croma Pincode Wise Price Alert Telegram Bot",
+  "name": "croma-price-bot",
+  "version": "2.0.0",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js"
   },
   "dependencies": {
     "node-telegram-bot-api": "^0.66.0",
-    "cheerio": "^1.0.0-rc.12",
-    "express": "^4.19.2",
-    "axios": "^1.6.8",
-    "puppeteer": "^22.6.0"
+    "axios": "^1.7.2",
+    "express": "^4.19.2"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
